@@ -348,6 +348,21 @@ def _per_tool_attrs(tool_name: str, tool_input: dict) -> dict:
         url = tool_input.get("url") or ""
         if url:
             out["tool.url"] = str(url)
+    elif tool_name == "todowrite":
+        # Keep stage completion observable without exporting the full todo
+        # text (which may contain prompts, paths, or design content).
+        todos = tool_input.get("todos")
+        if isinstance(todos, list):
+            import re
+            completed: list[int] = []
+            for todo in todos:
+                if not isinstance(todo, dict) or str(todo.get("status", "")).lower() != "completed":
+                    continue
+                match = re.search(r"\bStage\s+(\d+)\s*:", str(todo.get("content", "")), re.I)
+                if match:
+                    completed.append(int(match.group(1)))
+            if completed:
+                out["tool.completed_stages"] = json.dumps(sorted(set(completed)))
     return out
 
 
@@ -545,7 +560,7 @@ def _emit_tool_span(
     if title_raw:
         attrs["tool.description"] = redact_content(env.log_tool_details, title_raw)
     for k, v in specialized.items():
-        attrs[k] = redact_content(env.log_tool_details, v)
+        attrs[k] = v if k == "tool.completed_stages" else redact_content(env.log_tool_details, v)
     if user_id:
         attrs["user.id"] = user_id
 
