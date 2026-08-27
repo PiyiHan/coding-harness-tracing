@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -348,22 +349,118 @@ def _per_tool_attrs(tool_name: str, tool_input: dict) -> dict:
         url = tool_input.get("url") or ""
         if url:
             out["tool.url"] = str(url)
-    elif tool_name == "todowrite":
-        # Keep stage completion observable without exporting the full todo
-        # text (which may contain prompts, paths, or design content).
-        todos = tool_input.get("todos")
-        if isinstance(todos, list):
-            import re
-            completed: list[int] = []
-            for todo in todos:
-                if not isinstance(todo, dict) or str(todo.get("status", "")).lower() != "completed":
-                    continue
-                match = re.search(r"\bStage\s+(\d+)\s*:", str(todo.get("content", "")), re.I)
-                if match:
-                    completed.append(int(match.group(1)))
-            if completed:
-                out["tool.completed_stages"] = json.dumps(sorted(set(completed)))
     return out
+
+
+_EVAL_EVENT_PROTOCOL = "eval-events/v1"
+_EVAL_EVENT_MARKER = re.compile(r"<EVAL_EVENT>(.*?)</EVAL_EVENT>", re.DOTALL)
+# These tools return arbitrary file/search/web content.  A protocol-looking
+# snippet in that content is documentation, not an emitted checkpoint.  Input
+# is still inspected for every tool (the input is the agent's explicit carrier
+# request), while output from these content readers is fail-closed.
+_EVAL_EVENT_CONTENT_TOOLS = frozenset({"read", "grep", "glob", "webfetch"})
+
+
+def _eval_events_from_text(value: str) -> list[dict]:
+    """Project protocol fields before ordinary tool content is redacted.
+
+    Payload is intentionally omitted: ``eval.events`` is control telemetry,
+    not a way to bypass the tool-content privacy setting.
+    """
+    events: list[dict] = []
+    for match in _EVAL_EVENT_MARKER.finditer(value):
+        carrier = match.group(1)
+        object_start, object_end = carrier.find("{"), carrier.rfind("}")
+        if object_start < 0 or object_end < object_start:
+            continue
+        try:
+            candidate = json.loads(carrier[object_start:object_end + 1])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        projected = {key: candidate.get(key) for key in (
+            "protocol", "event_type", "entity_type", "entity_id", "state", "sequence"
+        )}
+        if projected["protocol"] != _EVAL_EVENT_PROTOCOL or projected["event_type"] != "state":
+            continue
+        if projected["state"] != "completed":
+            continue
+        if not isinstance(projected["entity_type"], str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]*", projected["entity_type"]
+        ):
+            continue
+        if not isinstance(projected["entity_id"], str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]*", projected["entity_id"]
+        ):
+            continue
+        if not isinstance(projected["sequence"], int) or isinstance(projected["sequence"], bool):
+            continue
+        events.append(projected)
+    return events
+
+
+def _eval_events_from_value(value: Any) -> list[dict]:
+    """Extract projected events from a tool input/result value.
+
+    OpenCode normally stores tool input as a mapping and serializes tool
+    results to text.  Accept both native envelopes and marked text, but return
+    only the fixed protocol fields so this helper cannot bypass content
+    redaction.
+    """
+    if isinstance(value, dict):
+        required = {"protocol", "event_type", "entity_type", "entity_id", "state", "sequence"}
+        if required.intersection(value):
+            projected = {key: value.get(key) for key in (
+                "protocol", "event_type", "entity_type", "entity_id", "state", "sequence"
+            )}
+            # Reuse the same validation path as marked envelopes.  Native
+            # JSON input must not be allowed to inject arbitrary attributes.
+            encoded = json.dumps(projected, separators=(",", ":"), sort_keys=True)
+            return _eval_events_from_text(f"<EVAL_EVENT>{encoded}</EVAL_EVENT>")
+        events: list[dict] = []
+        for child in value.values():
+            events.extend(_eval_events_from_value(child))
+        return events
+    if isinstance(value, (list, tuple)):
+        events: list[dict] = []
+        for child in value:
+            events.extend(_eval_events_from_value(child))
+        return events
+    if isinstance(value, str):
+        return _eval_events_from_text(value)
+    return []
+
+
+def _eval_event_attrs(tool_name: str, input_value: Any, output_text: str) -> dict[str, str]:
+    normalized_tool_name = str(tool_name).lower()
+    events: list[dict] = []
+    seen: set[str] = set()
+    # A tool input is always an explicit request from the agent, regardless
+    # of the concrete tool implementation (bash, python, MCP, etc.).
+    candidates = list(_eval_events_from_value(input_value))
+    # Results from content-reading tools are intentionally excluded so reading
+    # SKILL.md/reference files cannot turn their event examples into evidence.
+    if normalized_tool_name not in _EVAL_EVENT_CONTENT_TOOLS:
+        candidates.extend(_eval_events_from_text(output_text))
+    for event in candidates:
+        encoded = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        if encoded not in seen:
+            seen.add(encoded)
+            events.append(event)
+    return {"eval.events": json.dumps(events, sort_keys=True)} if events else {}
+
+
+def _llm_eval_event_attrs(output_text: str) -> dict[str, str]:
+    """Project explicit events emitted in an assistant message.
+
+    LLM output is subject to the prompt/content privacy setting below, so the
+    protocol projection must be extracted before redaction.  We intentionally
+    inspect output only: the prompt can contain the Skill's example envelope
+    and must never turn documentation into an observed event.
+    """
+    events = _eval_events_from_text(output_text)
+    return {"eval.events": json.dumps(events, sort_keys=True)} if events else {}
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +519,7 @@ def _emit_llm_span(
 
     prompt = (state.get("current_trace_prompt") or "") if prompt_override is None else prompt_override
     output_text = _text_of(parts)
+    eval_event_attrs = _llm_eval_event_attrs(output_text)
 
     # OpenInference: ``prompt`` is the total prompt and the cache buckets are
     # reported as ``prompt_details.*`` subsets of it. OpenCode's ``tokens.input``
@@ -453,6 +551,7 @@ def _emit_llm_span(
         attrs["llm.cost"] = cost
     if user_id:
         attrs["user.id"] = user_id
+    attrs.update(eval_event_attrs)
 
     span_name = f"LLM: {model_id}" if model_id else "LLM"
     span_id = _message_span_id(state, msg_id)
@@ -546,6 +645,7 @@ def _emit_tool_span(
     input_json_str = json.dumps(tool_input) if isinstance(tool_input, (dict, list)) else str(tool_input)
 
     specialized = _per_tool_attrs(tool_name, tool_input if isinstance(tool_input, dict) else {})
+    eval_event_attrs = _eval_event_attrs(tool_name, tool_input, output_raw)
 
     attrs: dict[str, Any] = {
         "session.id": session_id,
@@ -560,7 +660,8 @@ def _emit_tool_span(
     if title_raw:
         attrs["tool.description"] = redact_content(env.log_tool_details, title_raw)
     for k, v in specialized.items():
-        attrs[k] = v if k == "tool.completed_stages" else redact_content(env.log_tool_details, v)
+        attrs[k] = redact_content(env.log_tool_details, v)
+    attrs.update(eval_event_attrs)
     if user_id:
         attrs["user.id"] = user_id
 

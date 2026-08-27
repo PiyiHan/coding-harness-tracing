@@ -880,6 +880,128 @@ class TestRedaction:
         attrs = _get_attrs(bash)
         assert attrs["tool.name"]["stringValue"] == "bash"
 
+    def test_eval_event_is_projected_when_tool_content_is_redacted(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        payload = _make_payload_with_tool(
+            "bash",
+            {"command": "printf '%s\\n' '<EVAL_EVENT>' "
+                        "'{\"protocol\":\"eval-events/v1\",\"event_type\":\"state\","
+                        "\"entity_type\":\"testpoint\",\"entity_id\":\"preflight\","
+                        "\"state\":\"completed\",\"sequence\":1}' '</EVAL_EVENT>'"},
+        )
+
+        _handle_close(payload)
+
+        tool = _by_kind(captured_spans, "TOOL")[0]
+        attrs = _get_attrs(tool)
+        assert "redacted" in attrs["input.value"]["stringValue"]
+        events = json.loads(attrs["eval.events"]["stringValue"])
+        assert events == [{
+            "entity_id": "preflight", "entity_type": "testpoint",
+            "event_type": "state", "protocol": "eval-events/v1",
+            "sequence": 1, "state": "completed",
+        }]
+
+    def test_eval_event_can_be_projected_from_tool_output_only(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        payload = _make_payload_with_tool("emit", {"name": "checkpoint"})
+        payload["messages"][1]["parts"][1]["state"]["output"] = (
+            '<EVAL_EVENT>{"protocol":"eval-events/v1","event_type":"state",'
+            '"entity_type":"testpoint","entity_id":"preflight",'
+            '"state":"completed","sequence":1}</EVAL_EVENT>'
+        )
+
+        _handle_close(payload)
+
+        attrs = _get_attrs(_by_kind(captured_spans, "TOOL")[0])
+        assert "redacted" in attrs["output.value"]["stringValue"]
+        assert json.loads(attrs["eval.events"]["stringValue"])[0]["entity_id"] == "preflight"
+
+    def test_eval_event_can_be_projected_from_llm_output_when_content_is_redacted(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        payload = _load_fixture("reconcile_basic.json")
+        assistant = payload["messages"][1]
+        assistant["parts"][0]["text"] = (
+            '<EVAL_EVENT>{"protocol":"eval-events/v1","event_type":"state",'
+            '"entity_type":"testpoint","entity_id":"preflight",'
+            '"state":"completed","sequence":1}</EVAL_EVENT>'
+        )
+
+        _handle_close(dict(payload, type="close"))
+
+        llm = _by_kind(captured_spans, "LLM")[0]
+        attrs = _get_attrs(llm)
+        assert "redacted" in attrs["output.value"]["stringValue"]
+        assert json.loads(attrs["eval.events"]["stringValue"])[0]["entity_id"] == "preflight"
+
+    def test_read_tool_cannot_project_skill_event_examples(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        payload = _make_payload_with_tool(
+            "read",
+            {"filePath": "SKILL.md"},
+        )
+        payload["messages"][1]["parts"][1]["state"]["output"] = (
+            '<EVAL_EVENT>{"protocol":"eval-events/v1","event_type":"state",'
+            '"entity_type":"testpoint","entity_id":"preflight",'
+            '"state":"completed","sequence":1}</EVAL_EVENT>'
+        )
+
+        _handle_close(payload)
+
+        attrs = _get_attrs(_by_kind(captured_spans, "TOOL")[0])
+        assert "eval.events" not in attrs
+
+    def test_eval_event_is_projected_from_arbitrary_tool_input(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        """The protocol is carrier-agnostic; it must not depend on bash/emit names."""
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        payload = _make_payload_with_tool(
+            "python",
+            {
+                "script": (
+                    "print('<EVAL_EVENT>')\n"
+                    "print('{\"protocol\":\"eval-events/v1\",\"event_type\":\"state\","
+                    "\"entity_type\":\"testpoint\",\"entity_id\":\"handoff\","
+                    "\"state\":\"completed\",\"sequence\":7}')\n"
+                    "print('</EVAL_EVENT>')"
+                )
+            },
+        )
+
+        _handle_close(payload)
+
+        attrs = _get_attrs(_by_kind(captured_spans, "TOOL")[0])
+        assert "redacted" in attrs["input.value"]["stringValue"]
+        assert json.loads(attrs["eval.events"]["stringValue"])[0]["entity_id"] == "handoff"
+
+    def test_eval_event_is_projected_from_arbitrary_tool_output(
+        self, mock_resolve, mock_ensure, state, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        payload = _make_payload_with_tool("python", {"script": "emit_checkpoint()"})
+        payload["messages"][1]["parts"][1]["state"]["output"] = (
+            '<EVAL_EVENT>{"protocol":"eval-events/v1","event_type":"state",'
+            '"entity_type":"testpoint","entity_id":"handoff",'
+            '"state":"completed","sequence":7}</EVAL_EVENT>'
+        )
+
+        _handle_close(payload)
+
+        attrs = _get_attrs(_by_kind(captured_spans, "TOOL")[0])
+        assert "redacted" in attrs["output.value"]["stringValue"]
+        assert json.loads(attrs["eval.events"]["stringValue"])[0]["entity_id"] == "handoff"
+
 
 # ---------------------------------------------------------------------------
 # Per-tool specialized attribute mapping

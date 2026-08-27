@@ -24,6 +24,41 @@ opencode is fundamentally different from every other harness in this repo: exten
 
 Snapshots repeat across firings — that's what dedup is for. There is no streaming-chunk forwarding.
 
+## Evaluation event projection
+
+The OpenCode adapter can carry a small, privacy-safe control event for an external evaluation
+runtime. A skill under test emits an explicit envelope such as:
+
+```text
+<EVAL_EVENT>{"protocol":"eval-events/v1","event_type":"state",
+"entity_type":"testpoint","entity_id":"stage-3","state":"completed",
+"sequence":3}</EVAL_EVENT>
+```
+
+The Python reconciler extracts this envelope from an assistant output or a tool input/result before
+ordinary content redaction, then writes only these fields to the `eval.events` span attribute:
+`protocol`, `event_type`, `entity_type`, `entity_id`, `state`, and `sequence`. Event payloads,
+commands, paths, and tool results are not copied into this attribute. This is a structured projection,
+not a second span type and not a way to recover redacted content.
+
+This is an evaluation-specific extension maintained in this external repository. It is intentionally
+not a bash-only attribute: every completed tool is still a `TOOL` span, and any tool input (plus
+non-content-reader results) may carry one or more explicit events. The evaluation repository consumes
+the resulting `eval.events` attribute but does not vendor this reconciler. Once this patch is released,
+the evaluation environment must pin the published tracing commit; a local uncommitted checkout is only
+for development and is not reproduced by the baseline dependency pin.
+
+All completed tools remain `TOOL` spans. Every tool has `tool.name`, `input.value`, and `output.value`;
+known tools may also have attributes such as `tool.command`, `tool.file_path`, or `tool.query`.
+The specialized attributes follow `ARIZE_LOG_TOOL_DETAILS`; they can be redacted independently of
+the generic content setting. Only the `eval.events` allowlist projection is intentionally preserved
+when event extraction succeeds.
+When `ARIZE_LOG_TOOL_CONTENT=false`, the generic input/output values are intentionally represented as
+`<redacted (N chars)>`, while `eval.events` remains available to a consumer that needs the checkpoint.
+Results from content readers (`read`, `grep`, `glob`, and `webfetch`) are not treated as event
+carriers, preventing examples in a document from becoming evidence. The evaluation runtime reads
+`eval.events` from Phoenix; it does not read OpenCode snapshots directly.
+
 ## Setup
 The installer prompts for your backend (Phoenix or Arize AX) and project name, writes credentials to `~/.arize/harness/config.json`, and copies the plugin shim into `~/.config/opencode/plugin/arize-tracing.ts`. opencode auto-discovers plugins in that directory ([config docs](https://opencode.ai/docs/config/)) — no `opencode.json` edit is required. Spans are sent directly to the backend from the reconciler — no separate buffer/collector service is required.
 
@@ -119,7 +154,9 @@ Run any opencode session as you normally would. opencode loads the plugin on sta
 
 - Errors and reconciler stderr land in `~/.arize/harness/logs/opencode.log` always (the adapter redirects Python stderr there via `ARIZE_LOG_FILE`); set `export ARIZE_VERBOSE=true` before launching opencode to also see routine reconciler activity (snapshot ingest, span emits, dedup hits).
 - Confirm spans appear in your configured project in Arize AX or Phoenix.
+- In Phoenix span details, tool payloads are the standard `input.value` and `output.value` attributes. With `ARIZE_LOG_TOOL_CONTENT=false`, these intentionally show a length-only `<redacted ...>` placeholder; the privacy-safe `eval.events` checkpoint projection remains available to evaluators.
 - Set `ARIZE_TRACE_DEBUG=true` to dump the raw snapshot payloads under `~/.arize/harness/state/debug/` (files are named `opencode_reconcile_<ts>.json` / `opencode_close_<ts>.json`) for inspection.
+- A valid `<EVAL_EVENT>` using `eval-events/v1` is projected before redaction into the `eval.events` span attribute for every tool input, regardless of whether the carrier is `bash`, Python, an MCP tool, or a custom tool. Results from content readers such as `read`, `grep`, `glob`, and `webfetch` are excluded so event-looking examples in a document are not mistaken for runtime evidence; other tool results may carry one explicit event envelope. Only `protocol`, `event_type`, `entity_type`, `entity_id`, `state`, and `sequence` are retained. The full command/result remains in the standard `input.value`/`output.value` attributes and follows the normal privacy settings (it is intentionally redacted when `ARIZE_LOG_TOOL_CONTENT=false`).
 
 See the [main README's Environment variables section](../../README.md#environment-variables) for the full list of runtime overrides (`ARIZE_TRACE_ENABLED`, `ARIZE_DRY_RUN`, `ARIZE_USER_ID`, `ARIZE_PROJECT_NAME`, `ARIZE_VERBOSE`, `ARIZE_TRACE_DEBUG`, etc.).
 

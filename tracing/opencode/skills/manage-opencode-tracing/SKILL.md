@@ -178,6 +178,7 @@ Tell the user:
 - Toggle tracing on/off via `ARIZE_TRACE_ENABLED` env var (must be exported in the user's shell before launching opencode — the shim and reconciler inherit host env vars)
 - Tail the log file at `~/.arize/harness/logs/opencode.log` for real-time debugging
 - Mention `ARIZE_TRACE_DEBUG=true` to dump raw snapshot payloads under `~/.arize/harness/state/debug/` (files are named `opencode_reconcile_<ts>.json` / `opencode_close_<ts>.json`) for inspection
+- Explain that valid `eval-events/v1` envelopes in any tool input are projected to the redaction-safe `eval.events` span attribute, independent of the concrete tool implementation. Content-reader results (`read`, `grep`, `glob`, `webfetch`) are excluded so Skill documentation examples are not treated as events; other explicit tool results may also carry an event. This preserves only protocol/state identity fields, never command/result text or event payload. The full tool input/output remains under standard `input.value`/`output.value` and follows `ARIZE_LOG_TOOL_CONTENT` redaction.
 
 ## Architecture (How spans are produced)
 
