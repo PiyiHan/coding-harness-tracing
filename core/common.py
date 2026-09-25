@@ -721,6 +721,19 @@ def send_span(span_dict: dict) -> bool:
         if env.verbose:
             log(f"span payload: {json.dumps(span_dict)}")
 
+        # Native OTLP export preserves reconciler redaction and event projection.
+        # Explicit standard endpoint takes precedence over vendor configuration.
+        otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        if otlp_endpoint:
+            headers = {"Content-Type": "application/json"}
+            project = os.environ.get("SKILL_EVAL_TRACE_PROJECT")
+            if project:
+                headers["X-Trace-Project"] = project
+            req = urllib.request.Request(otlp_endpoint, data=json.dumps(span_dict).encode("utf-8"),
+                                         headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return 200 <= resp.status < 300
+
         backend = resolve_backend(span_dict)
         target = backend["target"]
 
